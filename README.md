@@ -20,23 +20,7 @@ DTP es un protocolo propietario de Cisco utilizado para negociar enlaces trunk e
 
 ## 🖥️ Topología
 
-```text
-                 ISP
-                  |
-                  |
-                 R2
-                  |
-              VLAN 20
-                  |
-                SW1
-               /   \
-              /     \
-           SW2    Kali Linux
-                    |
-                Atacante
-```
 
----
 
 ## 🌐 Direccionamiento IP
 
